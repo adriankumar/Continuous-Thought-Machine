@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn 
 import math
-
+import numpy as np
 
 #removes specified dimension from tensor, pytorch does not have an in-built nn.Squeeze(), hence this custom class is used for nn.<Module> chains rather than torch.tensors
 class Squeeze(nn.Module):
@@ -187,7 +187,6 @@ class SynapseUNet(nn.Module):
     
     #calculates width progression for unet layers using linear interpolation
     def _compute_layer_widths(self):
-        import numpy as np
         widths = np.linspace(self.output_neurons, self.minimum_width, self.network_depth)
         return [int(w) for w in widths]
     
