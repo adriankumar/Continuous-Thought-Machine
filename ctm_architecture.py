@@ -1,21 +1,35 @@
 import torch 
 import torch.nn as nn 
+import torch.nn.functional as F
 import numpy as np
 
+def compute_normalised_entropy(logits, reduction='mean'):
+    #calculates normalised entropy of logits along final dimension
+    preds = F.softmax(logits, dim=-1)
+    log_preds = torch.log_softmax(logits, dim=-1)
+    entropy = -torch.sum(preds * log_preds, dim=-1)
+    num_classes = preds.shape[-1]
+    max_entropy = torch.log(torch.tensor(num_classes, dtype=torch.float32))
+    normalised_entropy = entropy / max_entropy
+    if len(logits.shape) > 2 and reduction == 'mean':
+        normalised_entropy = normalised_entropy.flatten(1).mean(-1)
+    return normalised_entropy
 
 #--------------------------------------------------------------------------------------------------------------
 #                                                Continuous Thought Machine
 #--------------------------------------------------------------------------------------------------------------
 class ContinuousThoughtMachine(nn.Module):
+    #main ctm architecture implementing recurrent neural computation with synchronisation
     def __init__(self, num_neurons, memory_length, sync_size_out, sync_size_action, 
                  d_input, num_heads, unet_depth, iterations, output_classes, 
                  self_pairing_count=0, use_deep_nlm=False, use_layernorm=False, 
-                 dropout=0.0, temperature=1.0, min_unet_width=16):
+                 dropout=0.0, temperature=1.0, min_unet_width=16, prediction_reshaper=[-1]):
         super().__init__()
         
         self.num_neurons = num_neurons #total number of neurons in the model
         self.iterations = iterations #number of internal thinking steps
         self.output_classes = output_classes #final prediction dimension
+        self.prediction_reshaper = prediction_reshaper #shape for reshaping predictions before certainty calculation
         
         #build ctm architecture components
         self._build_ctm_components(
@@ -29,10 +43,10 @@ class ContinuousThoughtMachine(nn.Module):
                               nn.Parameter(torch.zeros(num_neurons).uniform_(
                                   -np.sqrt(1/num_neurons), np.sqrt(1/num_neurons)
                               )))
-
 #----------------------------
 # Architecture stuff
 #----------------------------
+    #builds core ctm architectural components
     def _build_ctm_components(self, num_neurons, memory_length, sync_size_out, sync_size_action,
                              d_input, num_heads, unet_depth, self_pairing_count, use_deep_nlm,
                              use_layernorm, dropout, temperature, min_unet_width):
@@ -82,6 +96,15 @@ class ContinuousThoughtMachine(nn.Module):
 #----------------------------
 # Forward Processing
 #----------------------------
+    #computes certainty of current prediction using normalised entropy
+    def compute_certainty(self, current_prediction):
+        batch_size = current_prediction.size(0)
+        reshaped_pred = current_prediction.reshape([batch_size] + self.prediction_reshaper)
+        normalised_entropy = compute_normalised_entropy(reshaped_pred)
+        current_certainty = torch.stack((normalised_entropy, 1-normalised_entropy), -1)
+        return current_certainty
+
+    #main forward pass implementing iterative thinking process
     def forward(self, input_features, track_internals=False):
         #input_features shape: batch x sequence_length x feature_dim
         batch_size = input_features.size(0)
@@ -103,8 +126,9 @@ class ContinuousThoughtMachine(nn.Module):
         #current post-activations start from learned initial state
         current_post_activations = self.initial_post_activations.unsqueeze(0).expand(batch_size, -1)
         
-        #storage for predictions across iterations
+        #storage for predictions and certainties across iterations
         predictions = torch.empty(batch_size, self.output_classes, self.iterations, device=device)
+        certainties = torch.empty(batch_size, 2, self.iterations, device=device)
         
         #main thinking loop - iterate over internal time steps
         for iteration in range(self.iterations):
@@ -142,9 +166,12 @@ class ContinuousThoughtMachine(nn.Module):
                 sync_state, output_pairwise_products, 'out', batch_size, device
             )
             
-            #generate prediction from output synchronisation
+            #generate prediction and certainty from output synchronisation
             current_prediction = self.output_projection(output_sync_vector)
+            current_certainty = self.compute_certainty(current_prediction)
+            
             predictions[:, :, iteration] = current_prediction
+            certainties[:, :, iteration] = current_certainty
             
             #track internal states if requested
             if track_internals:
@@ -153,11 +180,11 @@ class ContinuousThoughtMachine(nn.Module):
                 internal_states['output_sync'].append(output_sync_vector.detach().cpu())
                 internal_states['attention_weights'].append(attention_weights.detach().cpu())
         
-        #return predictions and optionally internal states
+        #return predictions, certainties and optionally internal states
         if track_internals:
-            return predictions, internal_states
+            return predictions, certainties, internal_states
         else:
-            return predictions
+            return predictions, certainties
 
 #--------------------------------------------------------------------------------------------------------------
 #                                                Attention Module
