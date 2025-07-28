@@ -21,20 +21,25 @@ def compute_normalised_entropy(logits, reduction='mean'):
 class ContinuousThoughtMachine(nn.Module):
     #main ctm architecture implementing recurrent neural computation with synchronisation
     def __init__(self, num_neurons, memory_length, sync_size_out, sync_size_action, 
-                 d_input, num_heads, unet_depth, iterations, output_classes, 
+                 attention_size, num_heads, unet_depth, thinking_steps, output_dim, 
                  self_pairing_count=0, use_deep_nlm=False, use_layernorm=False, 
                  dropout=0.0, temperature=1.0, min_unet_width=16, prediction_reshaper=[-1]):
         super().__init__()
         
         self.num_neurons = num_neurons #total number of neurons in the model
-        self.iterations = iterations #number of internal thinking steps
-        self.output_classes = output_classes #final prediction dimension
+        self.thinking_steps = thinking_steps #number of internal thinking steps
+        self.output_dim = output_dim #final prediction dimension
         self.prediction_reshaper = prediction_reshaper #shape for reshaping predictions before certainty calculation
+
+        self.config_data = self._store_config(num_neurons, memory_length, sync_size_out, sync_size_action, 
+                 attention_size, num_heads, unet_depth, thinking_steps, output_dim, 
+                 self_pairing_count, use_deep_nlm, use_layernorm, 
+                 dropout, temperature, min_unet_width, prediction_reshaper)
         
         #build ctm architecture components
         self._build_ctm_components(
             num_neurons, memory_length, sync_size_out, sync_size_action,
-            d_input, num_heads, unet_depth, self_pairing_count, use_deep_nlm,
+            attention_size, num_heads, unet_depth, self_pairing_count, use_deep_nlm,
             use_layernorm, dropout, temperature, min_unet_width
         )
         
@@ -46,9 +51,33 @@ class ContinuousThoughtMachine(nn.Module):
 #----------------------------
 # Architecture stuff
 #----------------------------
+    def _store_config(self, num_neurons, memory_length, sync_size_out, sync_size_action, 
+                 attention_size, num_heads, unet_depth, thinking_steps, output_dim, 
+                 self_pairing_count=0, use_deep_nlm=False, use_layernorm=False, 
+                 dropout=0.0, temperature=1.0, min_unet_width=16, prediction_reshaper=[-1]):
+        
+        return {
+            'num_neurons': num_neurons,
+            'PA_history_len': memory_length,
+            'sync_size_out': sync_size_out,
+            'sync_size_action': sync_size_action,
+            'attention_size': attention_size,
+            'attention_heads': num_heads,
+            'unet_depth': unet_depth,
+            'thinking_steps': thinking_steps,
+            'prediction_dim': output_dim,
+            'self_pairing_count': self_pairing_count,
+            'use_deep_nlm': use_deep_nlm,
+            'use_layer_norm': use_layernorm, #for NLM
+            'dropout': dropout,
+            'temperature':temperature,
+            'min_unet_width': min_unet_width,
+            'predictions_reshaper':prediction_reshaper
+        }
+
     #builds core ctm architectural components
     def _build_ctm_components(self, num_neurons, memory_length, sync_size_out, sync_size_action,
-                             d_input, num_heads, unet_depth, self_pairing_count, use_deep_nlm,
+                             attention_size, num_heads, unet_depth, self_pairing_count, use_deep_nlm,
                              use_layernorm, dropout, temperature, min_unet_width):
         
         #pre-activation history management
@@ -67,7 +96,7 @@ class ContinuousThoughtMachine(nn.Module):
         
         #attention mechanism for input interaction
         self.attention_module = AttentionModule(
-            d_input=d_input,
+            attention_size=attention_size,
             num_heads=num_heads,
             dropout=dropout
         )
@@ -91,7 +120,10 @@ class ContinuousThoughtMachine(nn.Module):
         )
         
         #final output projection from output synchronisation
-        self.output_projection = nn.Linear(sync_size_out, self.output_classes)
+        self.output_projection = nn.Linear(sync_size_out, self.output_dim)
+    
+    def get_config(self):
+        return self.config_data
 
 #----------------------------
 # Forward Processing
@@ -126,12 +158,12 @@ class ContinuousThoughtMachine(nn.Module):
         #current post-activations start from learned initial state
         current_post_activations = self.initial_post_activations.unsqueeze(0).expand(batch_size, -1)
         
-        #storage for predictions and certainties across iterations
-        predictions = torch.empty(batch_size, self.output_classes, self.iterations, device=device)
-        certainties = torch.empty(batch_size, 2, self.iterations, device=device)
+        #storage for predictions and certainties across thinking_steps
+        predictions = torch.empty(batch_size, self.output_dim, self.thinking_steps, device=device)
+        certainties = torch.empty(batch_size, 2, self.thinking_steps, device=device)
         
         #main thinking loop - iterate over internal time steps
-        for iteration in range(self.iterations):
+        for iteration in range(self.thinking_steps):
             
             #compute action synchronisation from current neuron states
             action_pairwise_products = self.synchronisation_manager.compute_pairwise_products(
@@ -190,10 +222,10 @@ class ContinuousThoughtMachine(nn.Module):
 #                                                Attention Module
 #--------------------------------------------------------------------------------------------------------------
 class AttentionModule(nn.Module):
-    def __init__(self, d_input, num_heads, dropout=0.0):
+    def __init__(self, attention_size, num_heads, dropout=0.0):
         super().__init__()
         
-        self.d_input = d_input #attention embedding dimension
+        self.attention_size = attention_size #attention embedding dimension
         self.num_heads = num_heads #number of attention heads
         self.dropout = dropout
         
@@ -205,17 +237,17 @@ class AttentionModule(nn.Module):
 #----------------------------
     def _build_attention_layers(self):
         #query projection maps action synchronisation vectors to attention dimension
-        self.query_projection = nn.LazyLinear(self.d_input) #sync_size -> d_input
+        self.query_projection = nn.LazyLinear(self.attention_size) #sync_size -> attention_size
         
         #key-value projection processes input features with normalisation
         self.kv_projection = nn.Sequential(
-            nn.LazyLinear(self.d_input), #feature_dim -> d_input
-            nn.LayerNorm(self.d_input) #normalise before attention
+            nn.LazyLinear(self.attention_size), #feature_dim -> attention_size
+            nn.LayerNorm(self.attention_size) #normalise before attention
         )
         
         #core multi-head cross-attention mechanism
         self.attention = nn.MultiheadAttention(
-            embed_dim=self.d_input,
+            embed_dim=self.attention_size,
             num_heads=self.num_heads,
             dropout=self.dropout,
             batch_first=True #batch dimension comes first
@@ -229,10 +261,10 @@ class AttentionModule(nn.Module):
         #action_sync_vector shape: batch x sync_size_action (from synchronisation manager)
         
         #project action sync vector to query dimension and add sequence dimension
-        queries = self.query_projection(action_sync_vector).unsqueeze(1) #shape: batch x 1 x d_input
+        queries = self.query_projection(action_sync_vector).unsqueeze(1) #shape: batch x 1 x attention_size
         
         #project input features to keys and values
-        keys_values = self.kv_projection(input_features) #shape: batch x sequence_length x d_input
+        keys_values = self.kv_projection(input_features) #shape: batch x sequence_length x attention_size
         
         #compute cross-attention where sync vector attends to input features
         attended_output, attention_weights = self.attention(
@@ -243,7 +275,7 @@ class AttentionModule(nn.Module):
         )
         
         #remove sequence dimension from attended output for further processing
-        attended_features = attended_output.squeeze(1) #shape: batch x d_input
+        attended_features = attended_output.squeeze(1) #shape: batch x attention_size
         
         return attended_features, attention_weights #attention_weights shape: batch x 1 x sequence_length
 
