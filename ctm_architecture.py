@@ -3,17 +3,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-def compute_normalised_entropy(logits, reduction='mean'):
-    #calculates normalised entropy of logits along final dimension
-    preds = F.softmax(logits, dim=-1)
-    log_preds = torch.log_softmax(logits, dim=-1)
-    entropy = -torch.sum(preds * log_preds, dim=-1)
-    num_classes = preds.shape[-1]
-    max_entropy = torch.log(torch.tensor(num_classes, dtype=torch.float32))
-    normalised_entropy = entropy / max_entropy
-    if len(logits.shape) > 2 and reduction == 'mean':
-        normalised_entropy = normalised_entropy.flatten(1).mean(-1)
-    return normalised_entropy
+# def compute_normalised_entropy(logits, reduction='mean'):
+#     #calculates normalised entropy of logits along final dimension
+#     preds = F.softmax(logits, dim=-1)
+#     log_preds = torch.log_softmax(logits, dim=-1)
+#     entropy = -torch.sum(preds * log_preds, dim=-1)
+#     num_classes = preds.shape[-1]
+#     max_entropy = torch.log(torch.tensor(num_classes, dtype=torch.float32))
+#     normalised_entropy = entropy / max_entropy
+#     if len(logits.shape) > 2 and reduction == 'mean':
+#         normalised_entropy = normalised_entropy.flatten(1).mean(-1)
+#     return normalised_entropy
 
 #--------------------------------------------------------------------------------------------------------------
 #                                                Continuous Thought Machine
@@ -128,13 +128,49 @@ class ContinuousThoughtMachine(nn.Module):
 #----------------------------
 # Forward Processing
 #----------------------------
-    #computes certainty of current prediction using normalised entropy
-    def compute_certainty(self, current_prediction):
-        batch_size = current_prediction.size(0)
-        reshaped_pred = current_prediction.reshape([batch_size] + self.prediction_reshaper)
-        normalised_entropy = compute_normalised_entropy(reshaped_pred)
-        current_certainty = torch.stack((normalised_entropy, 1-normalised_entropy), -1)
+    #computes certainty of current prediction using normalised entropy - classification tasks
+    # def compute_entropy_certainty(self, current_prediction):
+    #     batch_size = current_prediction.size(0)
+    #     reshaped_pred = current_prediction.reshape([batch_size] + self.prediction_reshaper)
+    #     normalised_entropy = compute_normalised_entropy(reshaped_pred)
+    #     current_certainty = torch.stack((normalised_entropy, 1-normalised_entropy), -1)
+    #     return current_certainty
+
+    #computes per-step certainty based on prediction consistency for regression tasks
+    def compute_prediction_consistency_certainty(self, predictions, current_step):
+        batch_size = predictions.size(0)
+        device = predictions.device
+        
+        if current_step == 0:
+            #first step has no history - neutral confidence
+            consistency_conf = torch.full((batch_size,), 0.5, device=device)
+        else:
+            #compute change from previous prediction
+            current_pred = predictions[:, 0, current_step]
+            previous_pred = predictions[:, 0, current_step - 1]
+            prediction_change = torch.abs(current_pred - previous_pred)
+            
+            #convert change to confidence - smaller change = higher confidence
+            consistency_conf = 1.0 / (1.0 + prediction_change)
+        
+        #stack as entropy and confidence for compatibility
+        current_certainty = torch.stack((1 - consistency_conf, consistency_conf), -1)
         return current_certainty
+
+    #computes overall reasoning confidence based on prediction variance across thinking steps
+    def compute_overall_reasoning_confidence(self, predictions):
+        #predictions shape: (batch_size, output_dim, thinking_steps)
+        batch_size = predictions.size(0)
+        
+        #compute variance across thinking steps for each batch sample
+        prediction_variance = torch.var(predictions[:, 0, :], dim=-1) #shape: (batch_size,)
+        
+        #convert variance to confidence - lower variance = higher confidence
+        overall_confidence = 1.0 / (1.0 + prediction_variance)
+        
+        #stack as entropy and confidence for compatibility
+        overall_certainty = torch.stack((1 - overall_confidence, overall_confidence), -1)
+        return overall_certainty
 
     #main forward pass implementing iterative thinking process
     def forward(self, input_features, track_internals=False):
@@ -198,11 +234,12 @@ class ContinuousThoughtMachine(nn.Module):
                 sync_state, output_pairwise_products, 'out', batch_size, device
             )
             
-            #generate prediction and certainty from output synchronisation
+            #generate prediction
             current_prediction = self.output_projection(output_sync_vector)
-            current_certainty = self.compute_certainty(current_prediction)
-            
             predictions[:, :, iteration] = current_prediction
+            
+            #compute per-step prediction consistency confidence
+            current_certainty = self.compute_prediction_consistency_certainty(predictions, iteration)
             certainties[:, :, iteration] = current_certainty
             
             #track internal states if requested
@@ -212,11 +249,14 @@ class ContinuousThoughtMachine(nn.Module):
                 internal_states['output_sync'].append(output_sync_vector.detach().cpu())
                 internal_states['attention_weights'].append(attention_weights.detach().cpu())
         
-        #return predictions, certainties and optionally internal states
+        #compute overall reasoning confidence after thinking loop
+        overall_reasoning_confidence = self.compute_overall_reasoning_confidence(predictions)
+        
+        #return predictions, per-step certainties, overall confidence and optionally internal states
         if track_internals:
-            return predictions, certainties, internal_states
+            return predictions, certainties, overall_reasoning_confidence, internal_states
         else:
-            return predictions, certainties
+            return predictions, certainties, overall_reasoning_confidence
 
 #--------------------------------------------------------------------------------------------------------------
 #                                                Attention Module
@@ -454,7 +494,7 @@ class NeuronLevelModel(nn.Module):
         out = torch.einsum('bnh,hrn->bnr', out, self.w2) + self.b2
         out = nn.functional.glu(out, dim=-1)  #results in single output per neuron
 
-        post_activations = out.squeeze(-1) / self.temperature
+        post_activations = out.squeeze(-1) / torch.clamp(self.temperature, min=1e-8) #small epislon to prevent division by zero even tho its initialised as 1 
         
         return post_activations
 
