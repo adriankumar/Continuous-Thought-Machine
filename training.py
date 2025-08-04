@@ -38,11 +38,16 @@ CTM_CONFIG = {
 #training configuration
 TRAINING_CONFIG = {
     'batch_size': 32,
-    'epochs': 10,
+    'epochs': 50,
     'learning_rate': 1e-3,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     'save_path': r"training_metrics\step_size_reasoning\test",
-    'save_freq': 2
+    'save_freq': 10,
+    'loss_weights': {  
+        'progressive': 1.0,
+        'confidence': 0.7, 
+        'convergence': 0.85
+    }
 }
 
 #dataset configuration
@@ -129,8 +134,8 @@ def run_training_pipeline():
         #training completed successfully
         print(f"\ntraining completed successfully!")
         print(f"final loss: {history['loss'][-1]:.4f}")
-        print(f"final accuracy: {history['accuracy'][-1]:.3f}")
-        print(f"final confidence: {history['confidence'][-1]:.3f}")
+        print(f"final accuracy: {history['final_accuracy'][-1]:.3f}")
+        print(f"final confidence: {history['final_confidence'][-1]:.3f}")
         
         return history, model
         
@@ -175,11 +180,12 @@ def main():
                     test_input = test_input.cuda()
                     model = model.cuda()
                 
-                predictions, certainties = model(test_input)
+                predictions, certainties, overall_reasoning_confidence = model(test_input)
                 predicted_answer = predictions[0, 0, -1].item()
                 confidence = certainties[0, 1, -1].item()
+                overall_conf = overall_reasoning_confidence[0, 1].item()
                 
-                print(f"  {test_seq} → predicted: {predicted_answer:.2f}, true: {true_answer}, confidence: {confidence:.3f}")
+                print(f"  {test_seq} → predicted: {predicted_answer:.2f}, true: {true_answer}, confidence: {confidence:.3f}, overall confidence: {overall_conf:.3f}")
         
     except KeyboardInterrupt:
         print("\ntraining interrupted by user")
